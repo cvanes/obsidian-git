@@ -34,7 +34,6 @@ export class OperationJournal {
     constructor(private readonly plugin: ObsidianGit) {}
 
     async start(op: MobileGitOp, detail?: string): Promise<void> {
-        if (!this.shouldRun()) return;
         const entry: JournalEntry = {
             op,
             startedAt: Date.now(),
@@ -48,7 +47,6 @@ export class OperationJournal {
     }
 
     async end(op: MobileGitOp): Promise<void> {
-        if (!this.shouldRun()) return;
         try {
             const existing = await this.read();
             // Only clear if this is the entry we wrote. A different op may
@@ -69,7 +67,6 @@ export class OperationJournal {
      * clearing it via {@link clear} once the user has been notified.
      */
     async readPrevious(): Promise<JournalEntry | undefined> {
-        if (!this.shouldRun()) return undefined;
         return this.read();
     }
 
@@ -92,9 +89,5 @@ export class OperationJournal {
             console.error("obsidian-git: journal read failed", e);
             return undefined;
         }
-    }
-
-    private shouldRun(): boolean {
-        return this.plugin.settings.mobileHardening;
     }
 }

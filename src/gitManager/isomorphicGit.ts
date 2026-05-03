@@ -10,7 +10,7 @@ import type {
     WalkerMap,
 } from "isomorphic-git";
 import git, { Errors, readBlob } from "isomorphic-git";
-import { Notice, Platform, requestUrl } from "obsidian";
+import { Notice, requestUrl } from "obsidian";
 import type ObsidianGit from "../main";
 import type {
     BranchInfo,
@@ -25,7 +25,6 @@ import { GeneralModal } from "../ui/modals/generalModal";
 import { splitRemoteBranch, worthWalking } from "../utils";
 import { GitManager } from "./gitManager";
 import { MyAdapter } from "./myAdapter";
-import diff3Merge from "diff3";
 
 export class IsomorphicGit extends GitManager {
     private readonly FILE = 0;
@@ -176,15 +175,6 @@ export class IsomorphicGit extends GitManager {
     }
 
     /**
-     * Whether the mobile-only hardened path should run. Always false on
-     * desktop (which uses simple-git anyway) and when the user has
-     * disabled mobile hardening.
-     */
-    private get hardened(): boolean {
-        return !Platform.isDesktopApp && this.plugin.settings.mobileHardening;
-    }
-
-    /**
      * Mark a working-tree path as potentially dirty so the next scoped
      * status walk inspects it. Called from vault events.
      */
@@ -289,7 +279,6 @@ export class IsomorphicGit extends GitManager {
         // fall back to a full walk and let it set the baseline.
         const SCOPED_MAX = 200;
         if (
-            !this.hardened ||
             !previous ||
             !this.hasFullStatusBaseline ||
             this.dirtyPaths.size === 0 ||
@@ -616,10 +605,8 @@ export class IsomorphicGit extends GitManager {
         const progressNotice = this.showNotice("Initializing pull");
         const lifecycle = this.plugin.mobileLifecycle;
         const journal = this.plugin.operationJournal;
-        if (this.hardened) {
-            lifecycle.beginOp("pull");
-            await journal.start("pull");
-        }
+        lifecycle.beginOp("pull");
+        await journal.start("pull");
         try {
             this.plugin.setPluginState({ gitAction: CurrentGitAction.pull });
 
@@ -629,53 +616,17 @@ export class IsomorphicGit extends GitManager {
 
             await this.checkAuthorInfo();
 
-            // On mobile we set abortOnConflict so the merge engine
-            // throws Errors.MergeConflictError instead of silently
-            // applying the configured `mergeStrategy` (which previously
-            // could overwrite the other side's edits with no conflict
-            // markers — see upstream issue #558). The catch block
-            // surfaces the conflict modal exactly as the desktop path
-            // does. Desktop / non-hardened paths keep the original
-            // behaviour for backwards-compatibility.
-            const useAbortOnConflict = this.hardened;
+            // abortOnConflict so the merge engine throws
+            // Errors.MergeConflictError instead of silently picking a
+            // side via a custom mergeDriver. Surfaces conflicts through
+            // handleConflict (caught below) — see upstream issue #558
+            // for the data-loss class this prevents.
             const mergeRes = await this.wrapFS(
                 git.merge({
                     ...this.getRepo(),
                     ours: branchInfo.current,
                     theirs: branchInfo.tracking!,
-                    abortOnConflict: useAbortOnConflict,
-                    mergeDriver:
-                        !useAbortOnConflict &&
-                        this.plugin.settings.mergeStrategy !== "none"
-                            ? ({ contents }) => {
-                                  const baseContent = contents[0];
-                                  const ourContent = contents[1];
-                                  const theirContent = contents[2];
-
-                                  const LINEBREAKS = /^.*(\r?\n|$)/gm;
-                                  const ours =
-                                      ourContent.match(LINEBREAKS) ?? [];
-                                  const base =
-                                      baseContent.match(LINEBREAKS) ?? [];
-                                  const theirs =
-                                      theirContent.match(LINEBREAKS) ?? [];
-                                  const result = diff3Merge(ours, base, theirs);
-                                  let mergedText = "";
-                                  for (const item of result) {
-                                      if (item.ok) {
-                                          mergedText += item.ok.join("");
-                                      }
-                                      if (item.conflict) {
-                                          mergedText +=
-                                              this.plugin.settings
-                                                  .mergeStrategy === "ours"
-                                                  ? item.conflict.a.join("")
-                                                  : item.conflict.b.join("");
-                                      }
-                                  }
-                                  return { cleanMerge: true, mergedText };
-                              }
-                            : undefined,
+                    abortOnConflict: true,
                 })
             );
             if (!mergeRes.alreadyMerged) {
@@ -725,10 +676,8 @@ export class IsomorphicGit extends GitManager {
             this.plugin.displayError(error);
             throw error;
         } finally {
-            if (this.hardened) {
-                lifecycle.endOp("pull");
-                await journal.end("pull");
-            }
+            lifecycle.endOp("pull");
+            await journal.end("pull");
         }
     }
 
@@ -739,10 +688,8 @@ export class IsomorphicGit extends GitManager {
         const progressNotice = this.showNotice("Initializing push");
         const lifecycle = this.plugin.mobileLifecycle;
         const journal = this.plugin.operationJournal;
-        if (this.hardened) {
-            lifecycle.beginOp("push");
-            await journal.start("push");
-        }
+        lifecycle.beginOp("push");
+        await journal.start("push");
         try {
             this.plugin.setPluginState({ gitAction: CurrentGitAction.status });
             const status = await this.branchInfo();
@@ -774,10 +721,8 @@ export class IsomorphicGit extends GitManager {
             this.plugin.displayError(error);
             throw error;
         } finally {
-            if (this.hardened) {
-                lifecycle.endOp("push");
-                await journal.end("push");
-            }
+            lifecycle.endOp("push");
+            await journal.end("push");
         }
     }
 
@@ -914,26 +859,24 @@ export class IsomorphicGit extends GitManager {
         const progressNotice = this.showNotice("Initializing clone");
         const lifecycle = this.plugin.mobileLifecycle;
         const journal = this.plugin.operationJournal;
-        if (this.hardened) {
-            lifecycle.beginOp("clone");
-            await journal.start("clone", url);
-        }
+        lifecycle.beginOp("clone");
+        await journal.start("clone", url);
         // Mobile devices repeatedly OOM on full clones of even moderately
         // sized vaults (upstream issues #475, #381, #694, #1013). When
-        // hardening is on and the user did not specify a depth, default
-        // to a shallow + single-branch + no-tags clone — the largest
-        // single reliability lever available without a backend swap.
+        // the user did not specify a depth, default to shallow +
+        // single-branch + no-tags — the largest single reliability lever
+        // available without a backend swap. Set mobileShallowDepth to 0
+        // to opt into a full clone.
         const effectiveDepth =
             depth !== undefined
                 ? depth
-                : this.hardened && this.plugin.settings.mobileShallowDepth > 0
+                : this.plugin.settings.mobileShallowDepth > 0
                   ? this.plugin.settings.mobileShallowDepth
                   : undefined;
-        const singleBranch =
-            this.hardened && this.plugin.settings.mobileSingleBranch
-                ? true
-                : undefined;
-        const noTags = this.hardened ? true : undefined;
+        const singleBranch = this.plugin.settings.mobileSingleBranch
+            ? true
+            : undefined;
+        const noTags = true;
         try {
             await this.wrapFS(
                 git.clone({
@@ -957,10 +900,8 @@ export class IsomorphicGit extends GitManager {
             this.plugin.displayError(error);
             throw error;
         } finally {
-            if (this.hardened) {
-                lifecycle.endOp("clone");
-                await journal.end("clone");
-            }
+            lifecycle.endOp("clone");
+            await journal.end("clone");
         }
     }
 
@@ -1003,7 +944,7 @@ export class IsomorphicGit extends GitManager {
         // pull() begins a "pull" op and calls fetch() internally; do not
         // start a nested fetch op in that case or we would clobber the
         // outer AbortController.
-        const ownLifecycle = this.hardened && !lifecycle.isOpInFlight();
+        const ownLifecycle = !lifecycle.isOpInFlight();
         if (ownLifecycle) {
             lifecycle.beginOp("fetch");
             await journal.start("fetch");
@@ -1021,11 +962,10 @@ export class IsomorphicGit extends GitManager {
                 remote: remote ?? (await this.getCurrentRemote()),
                 // Mirror the clone-time shallow defaults so subsequent
                 // fetches do not silently re-pull the full history.
-                singleBranch:
-                    this.hardened && this.plugin.settings.mobileSingleBranch
-                        ? true
-                        : undefined,
-                tags: this.hardened ? false : undefined,
+                singleBranch: this.plugin.settings.mobileSingleBranch
+                    ? true
+                    : undefined,
+                tags: false,
             };
 
             await this.wrapFS(git.fetch(args));

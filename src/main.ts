@@ -108,15 +108,12 @@ export default class ObsidianGit extends Plugin {
 
     async updateCachedStatus(): Promise<Status> {
         this.app.workspace.trigger("obsidian-git:loading-status");
-        // On mobile a full statusMatrix walk is the dominant cost of a
-        // refresh tick. When mobile hardening is on, ask the
-        // isomorphic-git backend to walk only the paths that have
-        // observed change events since the last refresh; the desktop
-        // backend has its own status implementation and is unaffected.
-        if (
-            this.gitManager instanceof IsomorphicGit &&
-            this.settings.mobileHardening
-        ) {
+        // On the isomorphic-git (mobile) backend a full statusMatrix
+        // walk is the dominant cost of a refresh tick; ask it to walk
+        // only the paths that have observed change events since the
+        // last refresh. The desktop simple-git backend has its own
+        // status implementation and is unaffected.
+        if (this.gitManager instanceof IsomorphicGit) {
             this.cachedStatus = await this.gitManager.scopedStatus(
                 this.cachedStatus
             );
@@ -359,7 +356,6 @@ export default class ObsidianGit extends Plugin {
      */
     private markPathDirty(vaultPath: string): void {
         if (!(this.gitManager instanceof IsomorphicGit)) return;
-        if (!this.settings.mobileHardening) return;
         const basePath = this.settings.basePath;
         if (basePath) {
             if (!vaultPath.startsWith(basePath + "/")) return;
@@ -602,14 +598,12 @@ export default class ObsidianGit extends Plugin {
             } else {
                 const isoManager = new IsomorphicGit(this);
                 this.gitManager = isoManager;
-                if (this.settings.mobileHardening) {
-                    // Repair a torn `.git/index` from a previous session
-                    // before the first git op runs. Cheap no-op when the
-                    // tmp file does not exist.
-                    await isoManager.runStartupRecovery();
-                    this.mobileLifecycle.register();
-                    await this.surfacePreviousInterruptedOp();
-                }
+                // Repair a torn `.git/index` from a previous session
+                // before the first git op runs. Cheap no-op when the
+                // tmp file does not exist.
+                await isoManager.runStartupRecovery();
+                this.mobileLifecycle.register();
+                await this.surfacePreviousInterruptedOp();
             }
 
             const result = await this.gitManager.checkRequirements();
@@ -1649,8 +1643,8 @@ I strongly recommend to use "Source mode" for viewing the conflicted files. For 
     }
 
     /**
-     * On mobile-hardened paths, check whether the previous session was
-     * interrupted mid-op (iOS suspension / OOM kill / force quit) and
+     * On the isomorphic-git (mobile) backend, check whether the previous
+     * session was interrupted mid-op (iOS suspension / OOM / force-quit) and
      * surface a one-time notice so the user knows the working tree may
      * be in a transient state. The journal is cleared after the notice.
      *

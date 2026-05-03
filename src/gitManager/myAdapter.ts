@@ -4,7 +4,7 @@
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type { DataAdapter, Vault } from "obsidian";
-import { normalizePath, Platform, TFile } from "obsidian";
+import { normalizePath, TFile } from "obsidian";
 import type ObsidianGit from "../main";
 
 export class MyAdapter {
@@ -206,10 +206,9 @@ export class MyAdapter {
      * Persist the cached `.git/index` to disk without dropping the cache.
      * Safe to call repeatedly (no-op if the cache is clean).
      *
-     * Uses an atomic `.git/index.tmp -> rename` when mobile hardening is
-     * enabled so an interrupted write (e.g. iOS WebView suspension) cannot
-     * leave a torn index. {@link recoverIndex} repairs the half-state on
-     * the next launch.
+     * Writes via an atomic `.git/index.tmp -> rename` so an interrupted
+     * write (e.g. iOS WebView suspension) cannot leave a torn index.
+     * {@link recoverIndex} repairs the half-state on the next launch.
      */
     async flushIndex(): Promise<void> {
         if (this.index === undefined || !this.indexDirty) return;
@@ -217,31 +216,23 @@ export class MyAdapter {
         const indexPath = this.plugin.gitManager.getRelativeVaultPath(
             this.gitDir + "/index"
         );
-
-        if (this.shouldHardenIndexWrites()) {
-            const tmpPath = indexPath + ".tmp";
-            await this.adapter.writeBinary(tmpPath, this.index, {
-                ctime: this.indexctime,
-                mtime: this.indexmtime,
-            });
+        const tmpPath = indexPath + ".tmp";
+        await this.adapter.writeBinary(tmpPath, this.index, {
+            ctime: this.indexctime,
+            mtime: this.indexmtime,
+        });
+        try {
+            await this.adapter.rename(tmpPath, indexPath);
+        } catch {
+            // Most adapters do not overwrite on rename. Remove the
+            // stale index and retry. If the second rename also fails,
+            // recoverIndex() on next launch will pick up the .tmp.
             try {
-                await this.adapter.rename(tmpPath, indexPath);
+                await this.adapter.remove(indexPath);
             } catch {
-                // Most adapters do not overwrite on rename. Remove the
-                // stale index and retry. If the second rename also fails,
-                // recoverIndex() on next launch will pick up the .tmp.
-                try {
-                    await this.adapter.remove(indexPath);
-                } catch {
-                    // ignore — file may not exist
-                }
-                await this.adapter.rename(tmpPath, indexPath);
+                // ignore — file may not exist
             }
-        } else {
-            await this.adapter.writeBinary(indexPath, this.index, {
-                ctime: this.indexctime,
-                mtime: this.indexmtime,
-            });
+            await this.adapter.rename(tmpPath, indexPath);
         }
         this.indexDirty = false;
     }
@@ -261,7 +252,6 @@ export class MyAdapter {
      * and the tmp is removed.
      */
     async recoverIndex(): Promise<void> {
-        if (!this.shouldHardenIndexWrites()) return;
         const indexPath = this.plugin.gitManager.getRelativeVaultPath(
             this.gitDir + "/index"
         );
@@ -278,10 +268,6 @@ export class MyAdapter {
                 // ignore
             }
         }
-    }
-
-    private shouldHardenIndexWrites(): boolean {
-        return this.plugin.settings.mobileHardening && !Platform.isDesktopApp;
     }
 
     private get gitDir(): string {

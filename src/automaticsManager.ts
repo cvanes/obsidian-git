@@ -1,4 +1,4 @@
-import { debounce, Platform } from "obsidian";
+import { debounce } from "obsidian";
 import type ObsidianGit from "./main";
 
 export default class AutomaticsManager {
@@ -23,10 +23,10 @@ export default class AutomaticsManager {
      *      align with the new wake time, not the stale pre-suspend
      *      schedule.
      *
-     * No-op on desktop or when mobile hardening is disabled.
+     * Only invoked from {@link MobileLifecycleManager}, which is itself
+     * only registered on the isomorphic-git (mobile) backend.
      */
     wake(): void {
-        if (!this.shouldWake()) return;
         if (this.plugin.localStorage.getPausedAutomatics()) return;
 
         const lastAutos = this.loadLastAuto();
@@ -56,10 +56,6 @@ export default class AutomaticsManager {
                 this.startAutoPush(0);
             }
         }
-    }
-
-    private shouldWake(): boolean {
-        return !Platform.isDesktopApp && this.plugin.settings.mobileHardening;
     }
 
     private saveLastAuto(date: Date, mode: "backup" | "pull" | "push") {

@@ -20,8 +20,8 @@ export type MobileGitOp =
  *  - On `visibilitychange` (visible), notifies the automatics scheduler
  *    so missed auto-pull / auto-commit ticks fire promptly.
  *
- * Desktop and the simple-git backend are unaffected — none of the
- * handlers run when {@link ObsidianGitSettings.mobileHardening} is off.
+ * Only registered when the isomorphic-git backend is selected (i.e. on
+ * mobile). The simple-git desktop backend never instantiates this class.
  */
 export class MobileLifecycleManager {
     private currentOp: MobileGitOp | undefined;
@@ -112,7 +112,6 @@ export class MobileLifecycleManager {
     }
 
     private async onHidden(): Promise<void> {
-        if (!this.shouldRun()) return;
         // Abort first so any in-flight HTTP wait is released as soon as
         // the underlying transport supports cancellation; flush after so
         // the cached index lands on disk regardless.
@@ -125,11 +124,6 @@ export class MobileLifecycleManager {
     }
 
     private onVisible(): void {
-        if (!this.shouldRun()) return;
         this.plugin.automaticsManager.wake();
-    }
-
-    private shouldRun(): boolean {
-        return this.plugin.settings.mobileHardening;
     }
 }
