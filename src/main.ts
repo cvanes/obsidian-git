@@ -12,6 +12,8 @@ import {
     TFolder,
     moment,
 } from "obsidian";
+import { MobileLifecycleManager } from "./mobile/lifecycleManager";
+import { OperationJournal } from "./mobile/operationJournal";
 import * as path from "path";
 import * as fsPromises from "fs/promises";
 import { pluginRef } from "src/pluginGlobalRef";
@@ -69,6 +71,8 @@ export default class ObsidianGit extends Plugin {
     automaticsManager = new AutomaticsManager(this);
     tools = new Tools(this);
     localStorage = new LocalStorageSettings(this);
+    mobileLifecycle = new MobileLifecycleManager(this);
+    operationJournal = new OperationJournal(this);
     settings: ObsidianGitSettings;
     settingsTab?: ObsidianGitSettingsTab;
     statusBar?: StatusBar;
@@ -104,7 +108,21 @@ export default class ObsidianGit extends Plugin {
 
     async updateCachedStatus(): Promise<Status> {
         this.app.workspace.trigger("obsidian-git:loading-status");
-        this.cachedStatus = await this.gitManager.status();
+        // On mobile a full statusMatrix walk is the dominant cost of a
+        // refresh tick. When mobile hardening is on, ask the
+        // isomorphic-git backend to walk only the paths that have
+        // observed change events since the last refresh; the desktop
+        // backend has its own status implementation and is unaffected.
+        if (
+            this.gitManager instanceof IsomorphicGit &&
+            this.settings.mobileHardening
+        ) {
+            this.cachedStatus = await this.gitManager.scopedStatus(
+                this.cachedStatus
+            );
+        } else {
+            this.cachedStatus = await this.gitManager.status();
+        }
         if (this.cachedStatus.conflicted.length > 0) {
             this.localStorage.setConflict(true);
             await this.branchBar?.display();
@@ -118,6 +136,21 @@ export default class ObsidianGit extends Plugin {
             this.cachedStatus
         );
         return this.cachedStatus;
+    }
+
+    /**
+     * Flush mobile-only volatile state (the cached `.git/index`) to disk
+     * synchronously enough to survive an iOS WebView suspension. Called
+     * by the {@link MobileLifecycleManager} on `visibilitychange`/
+     * `pagehide`.
+     *
+     * Safe to call when no isomorphic-git backend is active — the
+     * adapter's own dirty flag short-circuits the write.
+     */
+    async flushMobileState(): Promise<void> {
+        if (this.gitManager instanceof IsomorphicGit) {
+            await this.gitManager.flushIndex();
+        }
     }
 
     async refresh() {
@@ -249,29 +282,25 @@ export default class ObsidianGit extends Plugin {
                 this.onActiveLeafChange(leaf);
             })
         );
+        const onVaultChange = (file: TAbstractFile, fromPath?: string) => {
+            this.markPathDirty(file.path);
+            if (fromPath) this.markPathDirty(fromPath);
+            this.debRefresh();
+            this.autoCommitDebouncer?.();
+        };
         this.registerEvent(
-            this.app.vault.on("modify", () => {
-                this.debRefresh();
-                this.autoCommitDebouncer?.();
-            })
+            this.app.vault.on("modify", (file) => onVaultChange(file))
         );
         this.registerEvent(
-            this.app.vault.on("delete", () => {
-                this.debRefresh();
-                this.autoCommitDebouncer?.();
-            })
+            this.app.vault.on("delete", (file) => onVaultChange(file))
         );
         this.registerEvent(
-            this.app.vault.on("create", () => {
-                this.debRefresh();
-                this.autoCommitDebouncer?.();
-            })
+            this.app.vault.on("create", (file) => onVaultChange(file))
         );
         this.registerEvent(
-            this.app.vault.on("rename", () => {
-                this.debRefresh();
-                this.autoCommitDebouncer?.();
-            })
+            this.app.vault.on("rename", (file, oldPath) =>
+                onVaultChange(file, oldPath)
+            )
         );
 
         this.registerView(SOURCE_CONTROL_VIEW_CONFIG.type, (leaf) => {
@@ -321,6 +350,22 @@ export default class ObsidianGit extends Plugin {
         this.setRefreshDebouncer();
 
         addCommmands(this);
+    }
+
+    /**
+     * Forward a vault path to the isomorphic-git scoped-status tracker.
+     * Translates the vault-relative path to the repo-relative path the
+     * status walker expects, dropping paths that fall outside the repo.
+     */
+    private markPathDirty(vaultPath: string): void {
+        if (!(this.gitManager instanceof IsomorphicGit)) return;
+        if (!this.settings.mobileHardening) return;
+        const basePath = this.settings.basePath;
+        if (basePath) {
+            if (!vaultPath.startsWith(basePath + "/")) return;
+            vaultPath = vaultPath.substring(basePath.length + 1);
+        }
+        this.gitManager.markDirty(vaultPath);
     }
 
     setRefreshDebouncer(): void {
@@ -500,6 +545,7 @@ export default class ObsidianGit extends Plugin {
 
         this.editorIntegration.onUnloadPlugin();
         this.automaticsManager.unload();
+        this.mobileLifecycle.unregister();
         this.branchBar?.remove();
         this.statusBar?.remove();
         this.statusBar = undefined;
@@ -554,7 +600,16 @@ export default class ObsidianGit extends Plugin {
                 this.gitManager = new SimpleGit(this);
                 await (this.gitManager as SimpleGit).setGitInstance();
             } else {
-                this.gitManager = new IsomorphicGit(this);
+                const isoManager = new IsomorphicGit(this);
+                this.gitManager = isoManager;
+                if (this.settings.mobileHardening) {
+                    // Repair a torn `.git/index` from a previous session
+                    // before the first git op runs. Cheap no-op when the
+                    // tmp file does not exist.
+                    await isoManager.runStartupRecovery();
+                    this.mobileLifecycle.register();
+                    await this.surfacePreviousInterruptedOp();
+                }
             }
 
             const result = await this.gitManager.checkRequirements();
@@ -1591,6 +1646,27 @@ I strongly recommend to use "Source mode" for viewing the conflicted files. For 
             gitAction: CurrentGitAction.idle,
             offlineMode: true,
         });
+    }
+
+    /**
+     * On mobile-hardened paths, check whether the previous session was
+     * interrupted mid-op (iOS suspension / OOM kill / force quit) and
+     * surface a one-time notice so the user knows the working tree may
+     * be in a transient state. The journal is cleared after the notice.
+     *
+     * No-op on desktop or when no previous op was recorded.
+     */
+    private async surfacePreviousInterruptedOp(): Promise<void> {
+        const prev = await this.operationJournal.readPrevious();
+        if (!prev) return;
+        const minutesAgo = Math.round((Date.now() - prev.startedAt) / 60000);
+        new Notice(
+            `Git: previous ${prev.op}${
+                prev.detail ? ` (${prev.detail})` : ""
+            } was interrupted ~${minutesAgo}m ago and may not have completed. Re-run it from the source control view.`,
+            10000
+        );
+        await this.operationJournal.clear();
     }
 
     // region: displaying / formatting messages

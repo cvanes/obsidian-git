@@ -50,6 +50,9 @@ export const DEFAULT_SETTINGS: ObsidianGitSettings = {
         hunkCommands: false,
         statusBar: "disabled",
     },
+    mobileHardening: !Platform.isDesktopApp,
+    mobileShallowDepth: 1,
+    mobileSingleBranch: true,
     lineAuthor: {
         show: false,
         followMovement: "inactive",

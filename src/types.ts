@@ -71,6 +71,37 @@ export interface ObsidianGitSettings {
         showSigns: boolean;
         statusBar: "disabled" | "colored" | "monochrome";
     };
+    /**
+     * Mobile-specific stability hardening (iOS/Android isomorphic-git path).
+     *
+     * When enabled, the plugin:
+     *   - writes `.git/index` atomically via a `.tmp` rename,
+     *   - flushes the cached index and aborts in-flight git ops on
+     *     `visibilitychange`/`pagehide` so an iOS app suspension
+     *     cannot leave a half-written repo,
+     *   - clones/fetches shallow + single-branch by default,
+     *   - aborts on real merge conflicts instead of silently picking a side,
+     *   - tracks a dirty-path set from vault events to avoid full
+     *     `statusMatrix` walks on every change,
+     *   - records an operation journal so an interrupted op can be
+     *     detected and surfaced on next launch,
+     *   - replaces fixed `setTimeout` auto-routines with a
+     *     wake-and-catch-up model that fires when the app returns
+     *     to the foreground.
+     *
+     * Has no effect on desktop (the `simple-git` backend is unaffected).
+     */
+    mobileHardening: boolean;
+    /**
+     * Default depth used for clone/fetch on mobile when
+     * {@link ObsidianGitSettings.mobileHardening} is enabled.
+     * `0` disables the shallow default.
+     */
+    mobileShallowDepth: number;
+    /**
+     * Limit clone/fetch to the current branch only on mobile.
+     */
+    mobileSingleBranch: boolean;
 }
 
 /**

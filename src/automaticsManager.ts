@@ -1,4 +1,4 @@
-import { debounce } from "obsidian";
+import { debounce, Platform } from "obsidian";
 import type ObsidianGit from "./main";
 
 export default class AutomaticsManager {
@@ -7,6 +7,60 @@ export default class AutomaticsManager {
     private timeoutIDPull?: number;
 
     constructor(private readonly plugin: ObsidianGit) {}
+
+    /**
+     * Wake the auto-routines after a foreground transition. Mobile
+     * WebViews freeze `setTimeout` while backgrounded, so a timer
+     * scheduled for "20 minutes from now" can fire hours late or be
+     * cancelled outright by the OS (this is the underlying cause of
+     * upstream issue #793).
+     *
+     * On wake we:
+     *   1. Compute the elapsed wall-clock time since each "last auto"
+     *      stamp.
+     *   2. Run any auto whose interval has already elapsed.
+     *   3. Reschedule the next tick from "now" so subsequent firings
+     *      align with the new wake time, not the stale pre-suspend
+     *      schedule.
+     *
+     * No-op on desktop or when mobile hardening is disabled.
+     */
+    wake(): void {
+        if (!this.shouldWake()) return;
+        if (this.plugin.localStorage.getPausedAutomatics()) return;
+
+        const lastAutos = this.loadLastAuto();
+
+        if (this.plugin.settings.autoSaveInterval > 0) {
+            const elapsedMin =
+                (Date.now() - lastAutos.backup.getTime()) / 60000;
+            if (elapsedMin >= this.plugin.settings.autoSaveInterval) {
+                this.clearAutoCommitAndSync();
+                this.startAutoCommitAndSync(0);
+            }
+        }
+        if (this.plugin.settings.autoPullInterval > 0) {
+            const elapsedMin = (Date.now() - lastAutos.pull.getTime()) / 60000;
+            if (elapsedMin >= this.plugin.settings.autoPullInterval) {
+                this.clearAutoPull();
+                this.startAutoPull(0);
+            }
+        }
+        if (
+            this.plugin.settings.differentIntervalCommitAndPush &&
+            this.plugin.settings.autoPushInterval > 0
+        ) {
+            const elapsedMin = (Date.now() - lastAutos.push.getTime()) / 60000;
+            if (elapsedMin >= this.plugin.settings.autoPushInterval) {
+                this.clearAutoPush();
+                this.startAutoPush(0);
+            }
+        }
+    }
+
+    private shouldWake(): boolean {
+        return !Platform.isDesktopApp && this.plugin.settings.mobileHardening;
+    }
 
     private saveLastAuto(date: Date, mode: "backup" | "pull" | "push") {
         if (mode === "backup") {
