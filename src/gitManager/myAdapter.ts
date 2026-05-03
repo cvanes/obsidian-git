@@ -14,6 +14,7 @@ export class MyAdapter {
     index: ArrayBuffer | undefined;
     indexctime: number | undefined;
     indexmtime: number | undefined;
+    indexDirty = false;
     lastBasePath: string | undefined;
 
     constructor(
@@ -79,7 +80,13 @@ export class MyAdapter {
             if (path.endsWith(this.gitDir + "/index")) {
                 this.index = data;
                 this.indexmtime = Date.now();
-                // this.adapter.writeBinary(path, data);
+                this.indexDirty = true;
+                // The cached index is persisted via flushIndex() — at
+                // op end through saveAndClear, and on
+                // visibilitychange/pagehide via the mobile lifecycle
+                // manager. Eager per-mutation writes were measured to
+                // cause N writes per checkout-of-N-files and have been
+                // intentionally avoided.
             } else {
                 const file = this.vault.getAbstractFileByPath(path);
                 if (file instanceof TFile) {
@@ -191,25 +198,76 @@ export class MyAdapter {
     }
 
     async saveAndClear(): Promise<void> {
-        if (this.index !== undefined) {
-            await this.adapter.writeBinary(
-                this.plugin.gitManager.getRelativeVaultPath(
-                    this.gitDir + "/index"
-                ),
-                this.index,
-                {
-                    ctime: this.indexctime,
-                    mtime: this.indexmtime,
-                }
-            );
-        }
+        await this.flushIndex();
         this.clearIndex();
+    }
+
+    /**
+     * Persist the cached `.git/index` to disk without dropping the cache.
+     * Safe to call repeatedly (no-op if the cache is clean).
+     *
+     * Writes via an atomic `.git/index.tmp -> rename` so an interrupted
+     * write (e.g. iOS WebView suspension) cannot leave a torn index.
+     * {@link recoverIndex} repairs the half-state on the next launch.
+     */
+    async flushIndex(): Promise<void> {
+        if (this.index === undefined || !this.indexDirty) return;
+
+        const indexPath = this.plugin.gitManager.getRelativeVaultPath(
+            this.gitDir + "/index"
+        );
+        const tmpPath = indexPath + ".tmp";
+        await this.adapter.writeBinary(tmpPath, this.index, {
+            ctime: this.indexctime,
+            mtime: this.indexmtime,
+        });
+        try {
+            await this.adapter.rename(tmpPath, indexPath);
+        } catch {
+            // Most adapters do not overwrite on rename. Remove the
+            // stale index and retry. If the second rename also fails,
+            // recoverIndex() on next launch will pick up the .tmp.
+            try {
+                await this.adapter.remove(indexPath);
+            } catch {
+                // ignore — file may not exist
+            }
+            await this.adapter.rename(tmpPath, indexPath);
+        }
+        this.indexDirty = false;
     }
 
     clearIndex() {
         this.index = undefined;
         this.indexctime = undefined;
         this.indexmtime = undefined;
+        this.indexDirty = false;
+    }
+
+    /**
+     * Repair an interrupted index write. Should run before any git op
+     * after plugin start. If `.git/index.tmp` exists and `.git/index`
+     * does not, the tmp file is the most recent good copy and is
+     * promoted. If both exist, the live index is treated as authoritative
+     * and the tmp is removed.
+     */
+    async recoverIndex(): Promise<void> {
+        const indexPath = this.plugin.gitManager.getRelativeVaultPath(
+            this.gitDir + "/index"
+        );
+        const tmpPath = indexPath + ".tmp";
+        const tmpExists = await this.adapter.exists(tmpPath);
+        if (!tmpExists) return;
+        const indexExists = await this.adapter.exists(indexPath);
+        if (!indexExists) {
+            await this.adapter.rename(tmpPath, indexPath);
+        } else {
+            try {
+                await this.adapter.remove(tmpPath);
+            } catch {
+                // ignore
+            }
+        }
     }
 
     private get gitDir(): string {

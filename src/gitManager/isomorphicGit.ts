@@ -25,7 +25,6 @@ import { GeneralModal } from "../ui/modals/generalModal";
 import { splitRemoteBranch, worthWalking } from "../utils";
 import { GitManager } from "./gitManager";
 import { MyAdapter } from "./myAdapter";
-import diff3Merge from "diff3";
 
 export class IsomorphicGit extends GitManager {
     private readonly FILE = 0;
@@ -54,6 +53,20 @@ export class IsomorphicGit extends GitManager {
     private readonly noticeLength = 999_999;
     private readonly fs = new MyAdapter(this.app.vault, this.plugin);
 
+    /**
+     * Paths that may have changed in the working tree since the last full
+     * status walk, populated from vault events on mobile. Used by
+     * {@link IsomorphicGit.scopedStatus} to avoid full `statusMatrix`
+     * walks on every refresh tick.
+     */
+    private readonly dirtyPaths = new Set<string>();
+    /**
+     * `true` once a full `statusMatrix` walk has been completed in this
+     * session. Until then, we cannot incrementally trust the dirty set
+     * because there is no baseline to merge into.
+     */
+    private hasFullStatusBaseline = false;
+
     constructor(plugin: ObsidianGit) {
         super(plugin);
     }
@@ -66,6 +79,7 @@ export class IsomorphicGit extends GitManager {
         onAuthFailure: AuthFailureCallback;
         http: HttpClient;
     } {
+        const plugin = this.plugin;
         return {
             fs: this.fs,
             dir: this.plugin.settings.basePath,
@@ -109,6 +123,18 @@ export class IsomorphicGit extends GitManager {
                     headers,
                     body,
                 }: GitHttpRequest): Promise<GitHttpResponse> {
+                    // Surface a fast rejection if the lifecycle manager
+                    // aborted the current op (e.g. the iOS WebView was
+                    // hidden) before we begin the next request. The
+                    // underlying `requestUrl` cannot itself be cancelled,
+                    // but stopping between requests is enough to prevent
+                    // further partial writes after the user has
+                    // backgrounded the app.
+                    const signal = plugin.mobileLifecycle.currentSignal();
+                    if (signal?.aborted) {
+                        throw new Error("Aborted by lifecycle handler");
+                    }
+
                     // We can't stream yet, so collect body and set it to the ArrayBuffer
                     // because that's what requestUrl expects
                     let collectedBody: ArrayBuffer | undefined;
@@ -148,6 +174,44 @@ export class IsomorphicGit extends GitManager {
         }
     }
 
+    /**
+     * Mark a working-tree path as potentially dirty so the next scoped
+     * status walk inspects it. Called from vault events.
+     */
+    markDirty(repoRelativePath: string): void {
+        this.dirtyPaths.add(repoRelativePath);
+    }
+
+    /**
+     * Persist the cached `.git/index` to disk via the underlying
+     * adapter. Exposed so the mobile lifecycle manager can flush from
+     * outside the {@link IsomorphicGit.wrapFS} happy path (e.g. when
+     * the WebView is hidden mid-op).
+     */
+    async flushIndex(): Promise<void> {
+        await this.fs.flushIndex();
+    }
+
+    /**
+     * Run any one-shot startup recovery for the isomorphic-git path.
+     * Currently this means promoting a leftover `.git/index.tmp` back
+     * to `.git/index` if a previous session crashed mid atomic write.
+     */
+    async runStartupRecovery(): Promise<void> {
+        await this.fs.recoverIndex();
+    }
+
+    /**
+     * Drop the dirty-path set and the "have full baseline" flag.
+     * Called after destructive operations like checkout/merge/pull where
+     * the working tree may have shifted under us, forcing the next
+     * status to be a full walk.
+     */
+    invalidateStatusBaseline(): void {
+        this.dirtyPaths.clear();
+        this.hasFullStatusBaseline = false;
+    }
+
     async status(opts?: { path?: string }): Promise<Status> {
         let notice: Notice | undefined;
         const timeout = window.setTimeout(() => {
@@ -168,9 +232,10 @@ export class IsomorphicGit extends GitManager {
                 await this.wrapFS(git.statusMatrix(statusOpts))
             ).map((row) => this.getFileStatusResult(row));
 
+            const all: FileStatusResult[] = [];
             const changed: FileStatusResult[] = [];
             const staged: FileStatusResult[] = [];
-            const all: FileStatusResult[] = [];
+            const conflicted: string[] = [];
             for (const file of status) {
                 if (file.workingDir !== " ") {
                     changed.push(file);
@@ -182,13 +247,88 @@ export class IsomorphicGit extends GitManager {
                     all.push(file);
                 }
             }
-            const conflicted: string[] = [];
+            // Walking the full tree counts as our baseline for any
+            // future scoped status walks. Callers narrowing by `path`
+            // do *not* establish a baseline.
+            if (opts?.path == undefined) {
+                this.dirtyPaths.clear();
+                this.hasFullStatusBaseline = true;
+            }
             window.clearTimeout(timeout);
             notice?.hide();
             return { all, changed, staged, conflicted };
         } catch (error) {
             window.clearTimeout(timeout);
             notice?.hide();
+            this.plugin.displayError(error);
+            throw error;
+        }
+    }
+
+    /**
+     * Refresh the cached status using only paths the plugin observed
+     * change events for. Falls back to a full {@link IsomorphicGit.status}
+     * walk if no baseline exists yet, or if too many paths are dirty
+     * (the scoped walk would not save anything meaningful).
+     *
+     * Mobile-only: the desktop path uses simple-git which has its own
+     * status implementation.
+     */
+    async scopedStatus(previous: Status | undefined): Promise<Status> {
+        // No baseline, no previous result, or too many dirty paths —
+        // fall back to a full walk and let it set the baseline.
+        const SCOPED_MAX = 200;
+        if (
+            !previous ||
+            !this.hasFullStatusBaseline ||
+            this.dirtyPaths.size === 0 ||
+            this.dirtyPaths.size > SCOPED_MAX
+        ) {
+            return this.status();
+        }
+
+        const paths = Array.from(this.dirtyPaths);
+        // Snapshot then clear so concurrent change events that arrive
+        // during the walk are not lost — they will be picked up on the
+        // next refresh tick.
+        this.dirtyPaths.clear();
+        try {
+            this.plugin.setPluginState({ gitAction: CurrentGitAction.status });
+            const statusOpts = {
+                ...this.getRepo(),
+                filepaths: paths,
+            } as Parameters<typeof git.statusMatrix>[0];
+            const rows = await this.wrapFS(git.statusMatrix(statusOpts));
+            const updates = new Map<string, FileStatusResult>();
+            for (const row of rows) {
+                const result = this.getFileStatusResult(row);
+                updates.set(result.path, result);
+            }
+
+            // Merge: drop every entry from the previous status whose
+            // path was in the dirty set, then re-add only the still
+            // non-clean entries from the scoped walk.
+            const dirtySet = new Set(paths);
+            const all: FileStatusResult[] = previous.all.filter(
+                (f) => !dirtySet.has(f.path)
+            );
+            const changed: FileStatusResult[] = previous.changed.filter(
+                (f) => !dirtySet.has(f.path)
+            );
+            const staged: FileStatusResult[] = previous.staged.filter(
+                (f) => !dirtySet.has(f.path)
+            );
+            for (const file of updates.values()) {
+                if (file.workingDir !== " ") changed.push(file);
+                if (file.index !== " " && file.index !== "U") staged.push(file);
+                if (file.index !== " " || file.workingDir !== " ")
+                    all.push(file);
+            }
+            return { all, changed, staged, conflicted: previous.conflicted };
+        } catch (error) {
+            // On failure restore the dirty paths so the next refresh
+            // re-attempts them rather than silently dropping the signal.
+            for (const p of paths) this.dirtyPaths.add(p);
             this.plugin.displayError(error);
             throw error;
         }
@@ -463,6 +603,10 @@ export class IsomorphicGit extends GitManager {
 
     async pull(): Promise<FileStatusResult[]> {
         const progressNotice = this.showNotice("Initializing pull");
+        const lifecycle = this.plugin.mobileLifecycle;
+        const journal = this.plugin.operationJournal;
+        lifecycle.beginOp("pull");
+        await journal.start("pull");
         try {
             this.plugin.setPluginState({ gitAction: CurrentGitAction.pull });
 
@@ -472,43 +616,17 @@ export class IsomorphicGit extends GitManager {
 
             await this.checkAuthorInfo();
 
+            // abortOnConflict so the merge engine throws
+            // Errors.MergeConflictError instead of silently picking a
+            // side via a custom mergeDriver. Surfaces conflicts through
+            // handleConflict (caught below) — see upstream issue #558
+            // for the data-loss class this prevents.
             const mergeRes = await this.wrapFS(
                 git.merge({
                     ...this.getRepo(),
                     ours: branchInfo.current,
                     theirs: branchInfo.tracking!,
-                    abortOnConflict: false,
-                    mergeDriver:
-                        this.plugin.settings.mergeStrategy !== "none"
-                            ? ({ contents }) => {
-                                  const baseContent = contents[0];
-                                  const ourContent = contents[1];
-                                  const theirContent = contents[2];
-
-                                  const LINEBREAKS = /^.*(\r?\n|$)/gm;
-                                  const ours =
-                                      ourContent.match(LINEBREAKS) ?? [];
-                                  const base =
-                                      baseContent.match(LINEBREAKS) ?? [];
-                                  const theirs =
-                                      theirContent.match(LINEBREAKS) ?? [];
-                                  const result = diff3Merge(ours, base, theirs);
-                                  let mergedText = "";
-                                  for (const item of result) {
-                                      if (item.ok) {
-                                          mergedText += item.ok.join("");
-                                      }
-                                      if (item.conflict) {
-                                          mergedText +=
-                                              this.plugin.settings
-                                                  .mergeStrategy === "ours"
-                                                  ? item.conflict.a.join("")
-                                                  : item.conflict.b.join("");
-                                      }
-                                  }
-                                  return { cleanMerge: true, mergedText };
-                              }
-                            : undefined,
+                    abortOnConflict: true,
                 })
             );
             if (!mergeRes.alreadyMerged) {
@@ -525,6 +643,9 @@ export class IsomorphicGit extends GitManager {
                         remote: branchInfo.remote,
                     })
                 );
+                // Working tree just shifted — drop the dirty-path
+                // baseline so the next status walk inspects the world.
+                this.invalidateStatusBaseline();
             }
             progressNotice?.hide();
 
@@ -554,6 +675,9 @@ export class IsomorphicGit extends GitManager {
 
             this.plugin.displayError(error);
             throw error;
+        } finally {
+            lifecycle.endOp("pull");
+            await journal.end("pull");
         }
     }
 
@@ -562,6 +686,10 @@ export class IsomorphicGit extends GitManager {
             return 0;
         }
         const progressNotice = this.showNotice("Initializing push");
+        const lifecycle = this.plugin.mobileLifecycle;
+        const journal = this.plugin.operationJournal;
+        lifecycle.beginOp("push");
+        await journal.start("push");
         try {
             this.plugin.setPluginState({ gitAction: CurrentGitAction.status });
             const status = await this.branchInfo();
@@ -592,6 +720,9 @@ export class IsomorphicGit extends GitManager {
             progressNotice?.hide();
             this.plugin.displayError(error);
             throw error;
+        } finally {
+            lifecycle.endOp("push");
+            await journal.end("push");
         }
     }
 
@@ -673,7 +804,7 @@ export class IsomorphicGit extends GitManager {
 
     async checkout(branch: string, remote?: string): Promise<void> {
         try {
-            return this.wrapFS(
+            const res = await this.wrapFS(
                 git.checkout({
                     ...this.getRepo(),
                     ref: branch,
@@ -681,6 +812,8 @@ export class IsomorphicGit extends GitManager {
                     remote,
                 })
             );
+            this.invalidateStatusBaseline();
+            return res;
         } catch (error) {
             this.plugin.displayError(error);
             throw error;
@@ -724,13 +857,35 @@ export class IsomorphicGit extends GitManager {
 
     async clone(url: string, dir: string, depth?: number): Promise<void> {
         const progressNotice = this.showNotice("Initializing clone");
+        const lifecycle = this.plugin.mobileLifecycle;
+        const journal = this.plugin.operationJournal;
+        lifecycle.beginOp("clone");
+        await journal.start("clone", url);
+        // Mobile devices repeatedly OOM on full clones of even moderately
+        // sized vaults (upstream issues #475, #381, #694, #1013). When
+        // the user did not specify a depth, default to shallow +
+        // single-branch + no-tags — the largest single reliability lever
+        // available without a backend swap. Set mobileShallowDepth to 0
+        // to opt into a full clone.
+        const effectiveDepth =
+            depth !== undefined
+                ? depth
+                : this.plugin.settings.mobileShallowDepth > 0
+                  ? this.plugin.settings.mobileShallowDepth
+                  : undefined;
+        const singleBranch = this.plugin.settings.mobileSingleBranch
+            ? true
+            : undefined;
+        const noTags = true;
         try {
             await this.wrapFS(
                 git.clone({
                     ...this.getRepo(),
                     dir: dir,
                     url: url,
-                    depth: depth,
+                    depth: effectiveDepth,
+                    singleBranch,
+                    noTags,
                     onProgress: (progress) => {
                         if (progressNotice !== undefined) {
                             progressNotice.noticeEl.innerText =
@@ -744,6 +899,9 @@ export class IsomorphicGit extends GitManager {
             progressNotice?.hide();
             this.plugin.displayError(error);
             throw error;
+        } finally {
+            lifecycle.endOp("clone");
+            await journal.end("clone");
         }
     }
 
@@ -781,6 +939,16 @@ export class IsomorphicGit extends GitManager {
 
     async fetch(remote?: string): Promise<void> {
         const progressNotice = this.showNotice("Initializing fetch");
+        const lifecycle = this.plugin.mobileLifecycle;
+        const journal = this.plugin.operationJournal;
+        // pull() begins a "pull" op and calls fetch() internally; do not
+        // start a nested fetch op in that case or we would clobber the
+        // outer AbortController.
+        const ownLifecycle = !lifecycle.isOpInFlight();
+        if (ownLifecycle) {
+            lifecycle.beginOp("fetch");
+            await journal.start("fetch");
+        }
 
         try {
             const args = {
@@ -792,6 +960,12 @@ export class IsomorphicGit extends GitManager {
                     }
                 },
                 remote: remote ?? (await this.getCurrentRemote()),
+                // Mirror the clone-time shallow defaults so subsequent
+                // fetches do not silently re-pull the full history.
+                singleBranch: this.plugin.settings.mobileSingleBranch
+                    ? true
+                    : undefined,
+                tags: false,
             };
 
             await this.wrapFS(git.fetch(args));
@@ -800,6 +974,11 @@ export class IsomorphicGit extends GitManager {
             this.plugin.displayError(error);
             progressNotice?.hide();
             throw error;
+        } finally {
+            if (ownLifecycle) {
+                lifecycle.endOp("fetch");
+                await journal.end("fetch");
+            }
         }
     }
 

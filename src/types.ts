@@ -71,6 +71,17 @@ export interface ObsidianGitSettings {
         showSigns: boolean;
         statusBar: "disabled" | "colored" | "monochrome";
     };
+    /**
+     * Default depth used for clone/fetch on the isomorphic-git
+     * (mobile) backend. `0` disables the shallow default so the
+     * full history is fetched.
+     */
+    mobileShallowDepth: number;
+    /**
+     * Limit clone/fetch to the current branch only on the
+     * isomorphic-git (mobile) backend.
+     */
+    mobileSingleBranch: boolean;
 }
 
 /**
